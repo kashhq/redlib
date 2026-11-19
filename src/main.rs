@@ -159,6 +159,10 @@ async fn main() {
 	// The OAuth client must exist before the rate limit check (which uses it) and before the
 	// server accepts requests. Bootstrapped here, in the runtime, rather than lazily from a
 	// blocking static initializer — see the note on `OAUTH_SESSION` in oauth.rs.
+	// The app install the OAuth bootstrap mints for is stored in SQLite (app_install.rs), so the
+	// store opens first.
+	info!("Initializing SQLite database.");
+	db::init();
 	info!("Creating OAUTH client.");
 	let rate_limit = upstream_log::scope(Cause::Startup, async {
 		init_oauth_client().await;
@@ -208,8 +212,6 @@ async fn main() {
 	LazyLock::force(&config::CONFIG);
 	info!("Evaluating instance info.");
 	LazyLock::force(&instance_info::INSTANCE_INFO);
-	info!("Initializing SQLite database.");
-	db::init();
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {

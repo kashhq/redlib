@@ -1,8 +1,8 @@
-use crate::oauth_device::{AuthError, MobileSpoofAuth, OauthBackend};
+use crate::app_install::{self, Install};
+use crate::oauth_device::{self, AuthError};
 use arc_swap::ArcSwap;
 use log::{error, info, trace, warn};
 use std::{
-	collections::HashMap,
 	future::Future,
 	sync::{
 		atomic::{AtomicBool, AtomicU16, Ordering},
@@ -11,7 +11,7 @@ use std::{
 	time::{Duration, Instant},
 };
 use tokio::sync::OnceCell;
-use tokio::time::{error::Elapsed, timeout};
+use tokio::time::timeout;
 
 const OAUTH_MAX_ATTEMPTS: u32 = 10;
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,28 +29,32 @@ pub(crate) const FRESH_TOKEN_BUDGET: u16 = 99;
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(120);
 const TOKEN_REFRESH_FLOOR: Duration = Duration::from_secs(60);
 
-// Spoofed client for Android devices
-#[derive(Debug, Clone)]
+/// One anonymous token and the app install it was minted for (the install carries the loid that
+/// mint returned). No `Debug`: neither the token nor the loid may reach a log.
+#[derive(Clone)]
 pub struct Oauth {
-	pub(crate) headers_map: HashMap<String, String>,
+	token: String,
 	expires_in: u64,
 	minted_at: Instant,
-	pub(crate) backend: MobileSpoofAuth,
+	pub(crate) install: Install,
 }
 
 impl Oauth {
-	/// Mint a token for one spoofed Android device, retried up to OAUTH_MAX_ATTEMPTS times; Err
-	/// once they are spent. Callers in production exit on Err (see `exit_for_restart`).
-	async fn mint_mobile_spoof() -> Result<Self, String> {
+	/// Mint a token for `install`, retried up to OAUTH_MAX_ATTEMPTS times; Err once they are
+	/// spent. Callers in production exit on Err (see `exit_for_restart`).
+	async fn mint_with_retries(install: Install) -> Result<Self, String> {
 		// (Upstream also carries a GenericWebAuth fallback; Reddit answers 401 to its
 		// hardcoded client id, in upstream too, so it was removed here — see docs/fork.md.)
-		let backend = MobileSpoofAuth::new();
-
 		for attempt in 1..=OAUTH_MAX_ATTEMPTS {
-			match Self::new_with_timeout_with_backend(backend.clone()).await {
-				Ok(Ok(oauth)) => {
+			match timeout(OAUTH_TIMEOUT, oauth_device::mint(&install)).await {
+				Ok(Ok(minted)) => {
 					info!("[✅] Successfully created OAuth client");
-					return Ok(oauth);
+					return Ok(Self {
+						token: minted.token,
+						expires_in: minted.expires_in,
+						minted_at: Instant::now(),
+						install: install.with_loid(minted.loid),
+					});
 				}
 				Ok(Err(e)) => {
 					error!(
@@ -75,43 +79,43 @@ impl Oauth {
 		Err(format!("Failed to create OAuth client after {OAUTH_MAX_ATTEMPTS} attempts"))
 	}
 
-	async fn new_with_timeout_with_backend(mut backend: MobileSpoofAuth) -> Result<Result<Self, AuthError>, Elapsed> {
-		timeout(OAUTH_TIMEOUT, async move {
-			let response = backend.authenticate().await?;
-
-			// Build headers_map from backend headers + Authorization header
-			let mut headers_map = backend.get_headers();
-			headers_map.insert("Authorization".to_owned(), format!("Bearer {}", response.token));
-			headers_map.extend(response.additional_headers);
-
-			Ok(Self {
-				headers_map,
-				expires_in: response.expires_in,
-				minted_at: Instant::now(),
-				backend,
-			})
-		})
-		.await
+	pub(crate) fn token(&self) -> &str {
+		&self.token
 	}
 
-	pub fn user_agent(&self) -> &str {
-		self.backend.user_agent()
+	pub fn user_agent(&self) -> String {
+		self.install.user_agent()
 	}
 }
 
-/// The test seam for token rotation: one complete mint (retries included), the only network call
-/// `TokenManager` makes. Production uses `MobileSpoofMinter`; the offline tests below use a fake.
+/// The test seam for token rotation: one complete mint for `install` (retries included), the only
+/// network call `TokenManager` makes. Production uses `MobileSpoofMinter`; the offline tests below
+/// use a fake.
 pub(crate) trait Minter: Send + Sync + 'static {
-	fn mint(&self) -> impl Future<Output = Result<Oauth, String>> + Send;
+	fn mint(&self, install: Install) -> impl Future<Output = Result<Oauth, String>> + Send;
 }
 
-/// Production minter: a spoofed Android device against Reddit's auth endpoint.
+/// Production minter: the app install against Reddit's auth endpoint. Saves the install before
+/// minting and again after a mint succeeds (for the loid Reddit returns). The first save is for a
+/// block's replacement: if its mints all fail, the process exits, and the restart must load the
+/// new install, not the flagged one. For a renewal it rewrites the same row.
 pub(crate) struct MobileSpoofMinter;
 
 impl Minter for MobileSpoofMinter {
-	fn mint(&self) -> impl Future<Output = Result<Oauth, String>> + Send {
-		Oauth::mint_mobile_spoof()
+	async fn mint(&self, install: Install) -> Result<Oauth, String> {
+		app_install::persist(&install);
+		let oauth = Oauth::mint_with_retries(install).await?;
+		app_install::persist(&oauth.install);
+		Ok(oauth)
 	}
+}
+
+/// Which install a rotation mints for. A renewal (the daemon, a low budget, a 401) is the same
+/// app asking again; only a block replaces it (see `TokenManager::rotate_blocked`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstallChoice {
+	Keep,
+	Replace,
 }
 
 /// What a rotation request did. Production logs it (and exits on `Failed`); tests assert it.
@@ -137,8 +141,8 @@ pub(crate) struct TokenManager<M> {
 }
 
 impl<M: Minter> TokenManager<M> {
-	pub(crate) async fn bootstrap(minter: M) -> Result<Self, String> {
-		let first = minter.mint().await?;
+	pub(crate) async fn bootstrap(minter: M, install: Install) -> Result<Self, String> {
+		let first = minter.mint(install).await?;
 		Ok(Self {
 			current: ArcSwap::from_pointee(first),
 			rolling_over: AtomicBool::new(false),
@@ -166,9 +170,14 @@ impl<M: Minter> TokenManager<M> {
 		self.rolling_over.load(Ordering::SeqCst)
 	}
 
-	/// Mint a new token/device pair and swap it in. Single-flight: a call while another is
-	/// minting returns `AlreadyRotating` instead of minting twice.
+	/// Renew the token for the same install and swap it in.
 	pub(crate) async fn rotate(&self) -> Rotation {
+		self.rotate_with(InstallChoice::Keep).await
+	}
+
+	/// Mint a token for the install `choice` names and swap it in. Single-flight: a call while
+	/// another is minting returns `AlreadyRotating` instead of minting twice.
+	async fn rotate_with(&self, choice: InstallChoice) -> Rotation {
 		if self.rolling_over.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 			trace!("Skipping refresh token roll over, already in progress");
 			return Rotation::AlreadyRotating;
@@ -178,7 +187,19 @@ impl<M: Minter> TokenManager<M> {
 		let _guard = RollingOverGuard(&self.rolling_over);
 
 		trace!("Rolling over refresh token. Current rate limit: {}", self.ratelimit_remaining.load(Ordering::SeqCst));
-		match self.minter.mint().await {
+		let install = match choice {
+			InstallChoice::Keep => {
+				let install = self.current.load().install.clone();
+				info!("[🔄] same install {}, renewing token", install.device_prefix());
+				install
+			}
+			InstallChoice::Replace => {
+				let install = Install::new();
+				info!("[🔄] new install {}", install.device_prefix());
+				install
+			}
+		};
+		match self.minter.mint(install).await {
 			Ok(new_client) => {
 				self.current.store(Arc::new(new_client));
 				self.ratelimit_remaining.store(FRESH_TOKEN_BUDGET, Ordering::SeqCst);
@@ -191,15 +212,16 @@ impl<M: Minter> TokenManager<M> {
 
 	/// Reddit sometimes flags a long-lived token/device pair and answers every request with a
 	/// 403 HTML "blocked due to a network policy" page, while a freshly minted pair from the same
-	/// IP works (Oct 2026). Rotating both here is what a container restart used to do by hand.
+	/// IP works (Oct 2026). So a block, unlike a renewal, replaces the install: a new device,
+	/// phone and ids, and no loid.
 	pub(crate) async fn rotate_blocked(&self) -> Rotation {
 		let age = self.current.load().minted_at.elapsed();
 		if age < BLOCKED_TOKEN_REFRESH_COOLDOWN {
 			warn!("[🚫] Reddit blocked a token minted {age:?} ago; not rotating again yet (possible IP-level block)");
 			return Rotation::CoolingDown;
 		}
-		warn!("[🚫] Reddit blocked the current token (minted {age:?} ago). Rotating token and device...");
-		self.rotate().await
+		warn!("[🚫] Reddit blocked the current token (minted {age:?} ago). Replacing the install...");
+		self.rotate_with(InstallChoice::Replace).await
 	}
 }
 
@@ -230,11 +252,16 @@ pub(crate) fn exit_for_restart(reason: &str) -> ! {
 // 100% CPU before the server ever listened (Sept 2026 outage). Bootstrapping must stay async.
 static OAUTH_SESSION: OnceCell<TokenManager<MobileSpoofMinter>> = OnceCell::const_new();
 
-/// Bootstraps the OAuth client and starts the token-refresh daemon. Must complete, inside the
-/// tokio runtime, before anything calls `oauth_client()`. Idempotent: concurrent or repeated
+/// Bootstraps the OAuth client for the stored app install (a new one on the first start) and
+/// starts the token-refresh daemon. Must complete, inside the tokio runtime, before anything calls
+/// `oauth_client()`, and after `db::init()`. Idempotent: concurrent or repeated
 /// calls (tests) share the first initialization. Exits the process if every mint attempt fails.
 pub async fn init_oauth_client() {
-	let bootstrap = async { TokenManager::bootstrap(MobileSpoofMinter).await.unwrap_or_else(|e| exit_for_restart(&e)) };
+	let bootstrap = async {
+		TokenManager::bootstrap(MobileSpoofMinter, app_install::load_or_create())
+			.await
+			.unwrap_or_else(|e| exit_for_restart(&e))
+	};
 	init_then(&OAUTH_SESSION, bootstrap, || {
 		tokio::spawn(token_daemon());
 	})
@@ -266,7 +293,7 @@ pub(crate) fn oauth_session() -> &'static TokenManager<MobileSpoofMinter> {
 	OAUTH_SESSION.get().expect("OAuth client used before init_oauth_client() completed")
 }
 
-/// The live OAuth client (token + spoofed device headers).
+/// The live OAuth client (token + the app install it was minted for).
 pub fn oauth_client() -> &'static ArcSwap<Oauth> {
 	oauth_session().current()
 }
@@ -323,7 +350,7 @@ mod tests {
 	async fn test_oauth_client() {
 		// Integration test - tests the overall Oauth client
 		init_oauth_client().await;
-		assert!(oauth_client().load_full().headers_map.contains_key("Authorization"));
+		assert!(!oauth_client().load_full().token().is_empty());
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -335,56 +362,56 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	#[ignore = "hits live reddit"]
-	async fn test_oauth_token_exists() {
+	async fn test_oauth_install_has_a_loid() {
 		init_oauth_client().await;
-		let client = oauth_client().load_full();
-		let auth_header = client.headers_map.get("Authorization").unwrap();
-		assert!(auth_header.starts_with("Bearer "));
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
-	#[ignore = "hits live reddit"]
-	async fn test_oauth_headers_len() {
-		init_oauth_client().await;
-		assert!(oauth_client().load_full().headers_map.len() >= 3);
+		assert!(!oauth_client().load_full().install.loid.is_empty());
 	}
 
 	// Offline: a fake Minter stands in for Reddit's auth endpoint (AGENTS.md "Test seams").
 
 	use std::sync::atomic::AtomicUsize;
+	use std::sync::Mutex;
 	use tokio::sync::Notify;
 
-	/// A token named `bearer`, minted `age` ago, without touching the network.
-	fn fake_oauth(bearer: &str, age: Duration) -> Oauth {
+	/// A token named `token` for `install`, minted `age` ago, without touching the network.
+	fn fake_oauth(token: &str, age: Duration, install: Install) -> Oauth {
 		Oauth {
-			headers_map: HashMap::from([("Authorization".to_owned(), format!("Bearer {bearer}"))]),
+			token: token.to_owned(),
 			expires_in: 86_400,
 			minted_at: Instant::now().checked_sub(age).expect("test host has been up longer than the token age"),
-			backend: MobileSpoofAuth::new(),
+			install,
 		}
 	}
 
-	/// Mints `tok-1`, `tok-2`, ... (aged `age`), or fails while `fail` is set. With `gate`, each
-	/// mint first waits for one `notify_one`, so a test can hold a rotation mid-mint.
+	/// Mints `tok-1`, `tok-2`, ... (aged `age`) and hands out `loid-<n>` as Reddit hands out a
+	/// loid, or fails while `fail` is set. Records the install each mint was asked for. With
+	/// `gate`, each mint first waits for one `notify_one`, so a test can hold a rotation mid-mint.
 	#[derive(Default)]
 	struct FakeMinter {
 		calls: AtomicUsize,
 		fail: AtomicBool,
 		age: Duration,
 		gate: Option<Arc<Notify>>,
+		asked: Mutex<Vec<Install>>,
 	}
 
 	impl Minter for FakeMinter {
-		async fn mint(&self) -> Result<Oauth, String> {
+		async fn mint(&self, install: Install) -> Result<Oauth, String> {
 			if let Some(gate) = &self.gate {
 				gate.notified().await;
 			}
+			self.asked.lock().unwrap().push(install.clone());
 			let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
 			if self.fail.load(Ordering::SeqCst) {
 				return Err(format!("mint {n} refused"));
 			}
-			Ok(fake_oauth(&format!("tok-{n}"), self.age))
+			Ok(fake_oauth(&format!("tok-{n}"), self.age, install.with_loid(Some(format!("loid-{n}")))))
 		}
+	}
+
+	/// The install the `n`th mint (1-based) was asked for.
+	fn asked(manager: &TokenManager<FakeMinter>, n: usize) -> Install {
+		manager.minter.asked.lock().unwrap()[n - 1].clone()
 	}
 
 	/// Gated tests deadlock if single-flight breaks; fail them instead of hanging the suite.
@@ -395,20 +422,24 @@ mod tests {
 	}
 
 	fn bearer<M: Minter>(manager: &TokenManager<M>) -> String {
-		manager.current().load().headers_map["Authorization"].clone()
+		manager.current().load().token().to_owned()
+	}
+
+	fn device<M: Minter>(manager: &TokenManager<M>) -> String {
+		manager.current().load().install.device_id.clone()
 	}
 
 	async fn manager(minter: FakeMinter) -> TokenManager<FakeMinter> {
 		if let Some(gate) = &minter.gate {
 			gate.notify_one(); // let the bootstrap mint through
 		}
-		TokenManager::bootstrap(minter).await.unwrap()
+		TokenManager::bootstrap(minter, Install::new()).await.unwrap()
 	}
 
 	#[tokio::test]
 	async fn bootstrap_mints_once_with_a_full_budget() {
 		let m = manager(FakeMinter::default()).await;
-		assert_eq!(bearer(&m), "Bearer tok-1");
+		assert_eq!(bearer(&m), "tok-1");
 		assert_eq!(m.minter.calls.load(Ordering::SeqCst), 1);
 		assert_eq!(m.ratelimit_remaining().load(Ordering::SeqCst), FRESH_TOKEN_BUDGET);
 		assert!(!m.is_rolling_over());
@@ -427,7 +458,7 @@ mod tests {
 	async fn bootstrap_failure_is_an_error() {
 		let minter = FakeMinter::default();
 		minter.fail.store(true, Ordering::SeqCst);
-		assert_eq!(TokenManager::bootstrap(minter).await.err(), Some("mint 1 refused".to_owned()));
+		assert_eq!(TokenManager::bootstrap(minter, Install::new()).await.err(), Some("mint 1 refused".to_owned()));
 	}
 
 	// The expired-token path: fetch_reddit's 401 handling and the daemon both land here.
@@ -436,7 +467,7 @@ mod tests {
 		let m = manager(FakeMinter::default()).await;
 		m.ratelimit_remaining().store(3, Ordering::SeqCst);
 		assert_eq!(m.rotate().await, Rotation::Rotated);
-		assert_eq!(bearer(&m), "Bearer tok-2");
+		assert_eq!(bearer(&m), "tok-2");
 		assert_eq!(m.ratelimit_remaining().load(Ordering::SeqCst), FRESH_TOKEN_BUDGET);
 		assert!(!m.is_rolling_over());
 	}
@@ -446,12 +477,12 @@ mod tests {
 		let m = manager(FakeMinter::default()).await;
 		m.minter.fail.store(true, Ordering::SeqCst);
 		assert_eq!(m.rotate().await, Rotation::Failed("mint 2 refused".to_owned()));
-		assert_eq!(bearer(&m), "Bearer tok-1");
+		assert_eq!(bearer(&m), "tok-1");
 		assert!(!m.is_rolling_over(), "a failed mint must not leave the rotation flag set");
 
 		m.minter.fail.store(false, Ordering::SeqCst);
 		assert_eq!(m.rotate().await, Rotation::Rotated);
-		assert_eq!(bearer(&m), "Bearer tok-3");
+		assert_eq!(bearer(&m), "tok-3");
 	}
 
 	#[tokio::test]
@@ -503,11 +534,12 @@ mod tests {
 			..FakeMinter::default()
 		})
 		.await;
+		let install = m.current().load().install.clone();
 		m.current()
-			.store(Arc::new(fake_oauth("long-lived", BLOCKED_TOKEN_REFRESH_COOLDOWN + Duration::from_secs(1))));
+			.store(Arc::new(fake_oauth("long-lived", BLOCKED_TOKEN_REFRESH_COOLDOWN + Duration::from_secs(1), install)));
 
 		assert_eq!(m.rotate_blocked().await, Rotation::Rotated);
-		assert_eq!(bearer(&m), "Bearer tok-2");
+		assert_eq!(bearer(&m), "tok-2");
 		for _ in 0..3 {
 			assert_eq!(m.rotate_blocked().await, Rotation::CoolingDown);
 		}
@@ -518,7 +550,35 @@ mod tests {
 	async fn a_fresh_token_is_never_rotated_for_a_block() {
 		let m = manager(FakeMinter::default()).await;
 		assert_eq!(m.rotate_blocked().await, Rotation::CoolingDown);
-		assert_eq!(bearer(&m), "Bearer tok-1");
+		assert_eq!(bearer(&m), "tok-1");
+	}
+
+	// A renewal is the same app asking again: same device, and it sends the loid it was given.
+	#[tokio::test]
+	async fn a_renewal_keeps_the_install_and_sends_its_loid() {
+		let m = manager(FakeMinter::default()).await;
+		let first = device(&m);
+		assert_eq!(m.rotate().await, Rotation::Rotated);
+		assert_eq!(device(&m), first);
+		assert_eq!((asked(&m, 2).device_id, asked(&m, 2).loid.as_str().to_owned()), (first, "loid-1".to_owned()));
+		assert_eq!(m.current().load().install.loid, "loid-2", "the loid Reddit returns is kept");
+	}
+
+	// A block replaces the install: a new device and ids, minted without a loid.
+	#[tokio::test]
+	async fn a_blocked_rotation_mints_for_a_new_install() {
+		let m = manager(FakeMinter::default()).await;
+		let blocked = m.current().load().install.clone();
+		m.current()
+			.store(Arc::new(fake_oauth("flagged", BLOCKED_TOKEN_REFRESH_COOLDOWN + Duration::from_secs(1), blocked.clone())));
+
+		assert_eq!(m.rotate_blocked().await, Rotation::Rotated);
+		let fresh = asked(&m, 2);
+		assert_ne!(fresh.device_id, blocked.device_id);
+		assert_ne!(fresh.ad_id, blocked.ad_id);
+		assert_ne!(fresh.p_device_id, blocked.p_device_id);
+		assert!(fresh.loid.is_empty());
+		assert_eq!(device(&m), fresh.device_id);
 	}
 
 	#[test]

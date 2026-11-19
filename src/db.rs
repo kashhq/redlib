@@ -1,5 +1,5 @@
 use log::{error, info};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
@@ -23,7 +23,19 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS reading_history (
 		saved_at INTEGER NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_history_visited_at ON reading_history(visited_at);
-	CREATE INDEX IF NOT EXISTS idx_saved_subreddit ON saved_items(subreddit);";
+	CREATE INDEX IF NOT EXISTS idx_saved_subreddit ON saved_items(subreddit);
+	CREATE TABLE IF NOT EXISTS app_install (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		device_id TEXT NOT NULL,
+		version TEXT NOT NULL,
+		build INTEGER NOT NULL,
+		android INTEGER NOT NULL,
+		down_rate TEXT NOT NULL,
+		model TEXT NOT NULL,
+		ad_id TEXT NOT NULL,
+		p_device_id TEXT NOT NULL,
+		loid TEXT NOT NULL
+	);";
 
 // The process-wide store. Panics at first use if the directory behind REDLIB_DB_PATH is missing
 // or unwritable (docs/fork.md "Building on the Mac"); `main` forces it at startup via `init()`.
@@ -100,6 +112,36 @@ pub fn saved_items_grouped() -> Vec<SavedGroup> {
 pub fn cleanup_history() {
 	if let Err(e) = DB.lock().unwrap().cleanup_history(now()) {
 		error!("Failed to cleanup reading history: {e}");
+	}
+}
+
+/// The one Android-app install redlib presents as, as stored: a single row (`id = 1`). Mapped to
+/// and from `app_install::Install`, which owns its rules (release upgrades, phone choice).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppInstallRow {
+	pub device_id: String,
+	pub version: String,
+	pub build: i64,
+	pub android: i64,
+	pub down_rate: String,
+	pub model: String,
+	pub ad_id: String,
+	pub p_device_id: String,
+	pub loid: String,
+}
+
+/// The stored install, or None when there is none yet (or it cannot be read, which is logged).
+pub fn load_app_install() -> Option<AppInstallRow> {
+	DB.lock().unwrap().load_app_install().unwrap_or_else(|e| {
+		error!("Failed to read the app install: {e}");
+		None
+	})
+}
+
+/// Store `row` as the install, replacing any previous one.
+pub fn save_app_install(row: &AppInstallRow) {
+	if let Err(e) = DB.lock().unwrap().save_app_install(row) {
+		error!("Failed to save the app install: {e}");
 	}
 }
 
@@ -191,6 +233,48 @@ impl Store {
 		self.conn.execute("DELETE FROM reading_history WHERE visited_at < ?1", params![now - HISTORY_WINDOW_SECS])?;
 		Ok(())
 	}
+
+	fn load_app_install(&self) -> rusqlite::Result<Option<AppInstallRow>> {
+		self
+			.conn
+			.query_row(
+				"SELECT device_id, version, build, android, down_rate, model, ad_id, p_device_id, loid FROM app_install WHERE id = 1",
+				[],
+				|row| {
+					Ok(AppInstallRow {
+						device_id: row.get(0)?,
+						version: row.get(1)?,
+						build: row.get(2)?,
+						android: row.get(3)?,
+						down_rate: row.get(4)?,
+						model: row.get(5)?,
+						ad_id: row.get(6)?,
+						p_device_id: row.get(7)?,
+						loid: row.get(8)?,
+					})
+				},
+			)
+			.optional()
+	}
+
+	fn save_app_install(&self, row: &AppInstallRow) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"INSERT OR REPLACE INTO app_install (id, device_id, version, build, android, down_rate, model, ad_id, p_device_id, loid)
+			 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+			params![
+				row.device_id,
+				row.version,
+				row.build,
+				row.android,
+				row.down_rate,
+				row.model,
+				row.ad_id,
+				row.p_device_id,
+				row.loid
+			],
+		)?;
+		Ok(())
+	}
 }
 
 fn now() -> i64 {
@@ -263,7 +347,7 @@ mod tests {
 			.unwrap()
 			.map(Result::unwrap)
 			.collect();
-		assert_eq!(tables, ["idx_history_visited_at", "idx_saved_subreddit", "reading_history", "saved_items"]);
+		assert_eq!(tables, ["app_install", "idx_history_visited_at", "idx_saved_subreddit", "reading_history", "saved_items"]);
 	}
 
 	#[test]
@@ -341,6 +425,42 @@ mod tests {
 			.collect();
 		assert_eq!(shape, [("askscience", vec![("a2", "5m ago"), ("a1", "3h ago")]), ("rust", vec![("r1", "just now")])]);
 		assert_eq!((groups[1].items[0].title.as_str(), groups[1].items[0].url.as_str()), ("R", "/r1"));
+	}
+
+	fn install_row(device_id: &str, loid: &str) -> AppInstallRow {
+		AppInstallRow {
+			device_id: device_id.to_string(),
+			version: "2026.44.0".to_string(),
+			build: 2_644_001,
+			android: 15,
+			down_rate: "42.125".to_string(),
+			model: "Pixel 8".to_string(),
+			ad_id: "ad".to_string(),
+			p_device_id: "pd".to_string(),
+			loid: loid.to_string(),
+		}
+	}
+
+	#[test]
+	fn app_install_round_trips_as_one_row() {
+		let store = memory();
+		assert_eq!(store.load_app_install().unwrap(), None);
+		store.save_app_install(&install_row("dev-1", "")).unwrap();
+		assert_eq!(store.load_app_install().unwrap(), Some(install_row("dev-1", "")));
+
+		// A renewal saves the loid Reddit returned; a block saves a new device. Either replaces the row.
+		store.save_app_install(&install_row("dev-1", "loid-1")).unwrap();
+		store.save_app_install(&install_row("dev-2", "")).unwrap();
+		assert_eq!(store.load_app_install().unwrap(), Some(install_row("dev-2", "")));
+		let count: i64 = store.conn.query_row("SELECT COUNT(*) FROM app_install", [], |row| row.get(0)).unwrap();
+		assert_eq!(count, 1);
+	}
+
+	#[test]
+	fn app_install_survives_a_reopen() {
+		let file = TempDb::new("install");
+		Store::open(file.path()).unwrap().save_app_install(&install_row("dev-1", "loid-1")).unwrap();
+		assert_eq!(Store::open(file.path()).unwrap().load_app_install().unwrap(), Some(install_row("dev-1", "loid-1")));
 	}
 
 	#[test]

@@ -1,3 +1,5 @@
+pub mod app_install;
+pub mod app_wire;
 pub mod breaker;
 pub mod client;
 pub mod comments;
@@ -18,7 +20,6 @@ pub mod media_proxy;
 pub mod model;
 pub mod oauth;
 pub mod oauth_device;
-pub mod oauth_resources;
 pub mod post;
 pub mod preferences;
 pub mod reddit_path;
