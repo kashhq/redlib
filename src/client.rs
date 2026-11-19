@@ -1,10 +1,11 @@
+use crate::app_wire::{self, Ctx};
 use crate::breaker::{clock, unix_now, Breaker};
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, oauth_client, oauth_session, refresh_blocked_token};
 use crate::reddit_response::{interpret_response, TokenAction};
 use crate::rewrite::format_url;
 use crate::swr_cache::SwrCache;
-use crate::transport::CLIENT;
+use crate::transport::{CRONET, OKHTTP};
 use crate::upstream_log;
 use cached::proc_macro::cached;
 use futures_lite::{future::Boxed, FutureExt};
@@ -16,26 +17,21 @@ use std::result::Result;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
-use wreq::{header as wreq_header, Method, RequestBuilder, Response as WreqResponse};
+use wreq::{header as wreq_header, Method, Response as WreqResponse};
 
+// The host is never set by hand: wreq derives `:authority` (or `Host`) from each URL.
 const REDDIT_URL_BASE: &str = "https://oauth.reddit.com";
-const REDDIT_URL_BASE_HOST: &str = "oauth.reddit.com";
 
 // Android app's GraphQL endpoint: the primary source of every read (`sources`), and of thread
 // comments (`thread::fetch`, gql_comments.rs).
 const GQL_URL: &str = "https://gql-fed.reddit.com/";
-const GQL_URL_HOST: &str = "gql-fed.reddit.com";
 
 const REDDIT_SHORT_URL_BASE: &str = "https://redd.it";
-const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
-const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 
-const URL_PAIRS: [(&str, &str); 2] = [
-	(ALTERNATIVE_REDDIT_URL_BASE, ALTERNATIVE_REDDIT_URL_BASE_HOST),
-	(REDDIT_SHORT_URL_BASE, REDDIT_SHORT_URL_BASE_HOST),
-];
+// Where `canonical_path` resolves a share link, in order.
+const SHORT_URL_BASES: [&str; 2] = [ALTERNATIVE_REDDIT_URL_BASE, REDDIT_SHORT_URL_BASE];
 
 /// Gets the canonical path for a resource on Reddit. This is accomplished by
 /// making a `HEAD` request to Reddit at the path given in `path`.
@@ -58,10 +54,10 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 
 	// for each URL pair, try the HEAD request
 	let res = {
-		// for url base and host in URL_PAIRS, try reddit_short_head(path.clone(), true, url_base, url_base_host) and if it succeeds, set res. else, res = None
+		// HEAD the path on each base in turn, stopping at the first that is not a client error.
 		let mut res = None;
-		for (url_base, url_base_host) in URL_PAIRS {
-			res = reddit_short_head(path.clone(), true, url_base, url_base_host).await.ok();
+		for url_base in SHORT_URL_BASES {
+			res = reddit_short_head(path.clone(), true, url_base).await.ok();
 			if let Some(res) = &res {
 				if !res.status().is_client_error() {
 					break;
@@ -127,56 +123,27 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
+	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE)
 }
 
-/// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
-fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::HEAD, path, false, quarantine, base_path, host)
+/// Makes a HEAD request to Reddit at `path`, using the short URL base. This will not follow redirects.
+fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str) -> Boxed<Result<WreqResponse, String>> {
+	request(&Method::HEAD, path, false, quarantine, base_path)
 }
 
-// /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
-// fn reddit_head(path: String, quarantine: bool) -> Boxed<Result<Response<Body>, String>> {
-// 	request(&Method::HEAD, path, false, quarantine, false)
-// }
-// Unused - reddit_head is only ever called in the context of a short URL
-
-/// The headers of every request to Reddit: Host, the quarantine opt-in cookie (empty when not
-/// opted in), the OAuth client's headers, and `content_type` unless those already carry one.
-/// Used by `request` (GET/HEAD) and `gql_post`.
-fn with_reddit_headers(mut builder: RequestBuilder, host: &str, quarantine: bool, content_type: Option<&str>) -> RequestBuilder {
-	let mut headers: Vec<(String, String)> = vec![
-		("Host".into(), host.into()),
-		(
-			"Cookie".into(),
-			if quarantine {
-				"_options=%7B%22pref_quarantine_optin%22%3A%20true%2C%20%22pref_gated_sr_optin%22%3A%20true%7D".into()
-			} else {
-				"".into()
-			},
-		),
-	];
-	headers.extend(oauth_client().load_full().headers_map.clone());
-	if let Some(content_type) = content_type.filter(|_| !headers.iter().any(|(key, _)| key.eq_ignore_ascii_case("content-type"))) {
-		headers.push(("Content-Type".into(), content_type.into()));
-	}
-
-	// shuffle headers: https://github.com/redlib-org/redlib/issues/324
-	fastrand::shuffle(&mut headers);
-
-	for (key, value) in headers {
-		builder = builder.header(key, value);
-	}
-	builder
-}
-
-/// Makes a request to Reddit. If `redirect` is `true`, `request_with_redirect`
-/// will recurse on the URL that Reddit provides in the Location HTTP header
-/// in its response.
-fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+/// Makes a request to Reddit, as the app's REST client sends a read (`app_wire::read_headers`, on
+/// `transport::OKHTTP`). If `redirect` is `true`, it recurses on the URL that Reddit provides in
+/// the Location HTTP header in its response.
+fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str) -> Boxed<Result<WreqResponse, String>> {
 	// Build Reddit URL from path.
 	let url = format!("{base_path}{path}");
-	let builder = with_reddit_headers(CLIENT.request(method.clone(), &url), host, quarantine, None);
+	let builder = {
+		let oauth = oauth_client().load();
+		app_wire::apply(
+			OKHTTP.request(method.clone(), &url),
+			app_wire::read_headers(&Ctx::live(&oauth.install), oauth.token(), quarantine),
+		)
+	};
 
 	async move {
 		let kind = if *method == Method::HEAD { upstream_log::Kind::Head } else { upstream_log::Kind::Rest };
@@ -222,7 +189,6 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 						true,
 						quarantine,
 						base_path,
-						host,
 					)
 					.await;
 				};
@@ -348,19 +314,19 @@ pub(crate) async fn fetch_gql(body: Value) -> Result<Value, String> {
 	let operation = body["operationName"].as_str().unwrap_or("unnamed").to_string();
 	// Not a thread route, so a non-JSON 403 here rotates the token as it does for a listing.
 	let label = format!("gql:{operation}");
-	let mut retried = false;
+	// The resend count goes out as `X-Reddit-Retry: attempt=<n>`, as the app's client counts them.
+	let mut attempt = 0;
 	loop {
-		let request = body.clone();
-		let response = fetch_reddit(&label, Budget::Gql, move || gql_post(&request)).await?;
+		let response = fetch_reddit(&label, Budget::Gql, || gql_post(&body, attempt)).await?;
 		let Some(message) = gql_error(&response) else {
 			return Ok(response);
 		};
-		if retried || message.contains("PersistedQueryNotFound") {
+		if attempt > 0 || message.contains("PersistedQueryNotFound") {
 			warn!("[gql] {operation} failed: {message}");
 			return Err(format!("Reddit GraphQL {operation} error: {message}"));
 		}
 		warn!("[gql] {operation} answered an error, retrying once: {message}");
-		retried = true;
+		attempt += 1;
 	}
 }
 
@@ -371,11 +337,17 @@ fn gql_error(response: &Value) -> Option<String> {
 	Some(first["message"].as_str().map_or_else(|| first.to_string(), str::to_string).chars().take(200).collect())
 }
 
-/// POST `body` to gql-fed with the same identity as every other Reddit request.
-fn gql_post(body: &Value) -> Boxed<Result<WreqResponse, String>> {
+/// POST `body` to gql-fed as the app's Apollo client does over Cronet (`app_wire::gql_headers`,
+/// on `transport::CRONET`), the same install and token as every other Reddit request.
+fn gql_post(body: &Value, attempt: u8) -> Boxed<Result<WreqResponse, String>> {
 	let operation = body["operationName"].as_str().unwrap_or("unnamed").to_string();
-	let builder = with_reddit_headers(CLIENT.post(GQL_URL), GQL_URL_HOST, false, Some("application/json")).body(body.to_string());
+	let builder = app_wire::gql_payload(body).map(|payload| {
+		let oauth = oauth_client().load();
+		let headers = app_wire::gql_headers(&Ctx::live(&oauth.install), oauth.token(), &payload, attempt);
+		app_wire::apply(CRONET.post(GQL_URL), headers).body(payload.json)
+	});
 	async move {
+		let builder = builder.map_err(|e| format!("Couldn't serialize GraphQL {operation}: {e}"))?;
 		let in_flight = upstream_log::start(upstream_log::Kind::Gql, &operation);
 		let sent = builder.send().await;
 		in_flight.finish(&sent);

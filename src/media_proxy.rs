@@ -1,13 +1,15 @@
 //! The media proxy behind `/img`, `/vid`, `/thumb` and the other media routes in `main.rs`:
-//! fetches from Reddit's CDN with the spoofed device's User-Agent and strips CDN headers.
+//! fetches from Reddit's CDN on the app's OkHttp transport with the install's User-Agent
+//! (`app_wire::media_headers`) and strips CDN headers.
 
+use crate::app_wire;
 use crate::oauth::oauth_client;
 use crate::server::RequestExt;
-use crate::transport::CLIENT;
+use crate::transport::OKHTTP;
 use crate::upstream_log;
 use hyper::{header, Body, Request as HyperRequest, Response as HyperResponse};
 use log::{error, warn};
-use wreq::{header as wreq_header, Response as WreqResponse};
+use wreq::Response as WreqResponse;
 
 pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperResponse<Body>, String> {
 	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
@@ -27,24 +29,16 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	const MAX_ATTEMPTS: u32 = 3;
 	let mut last_err = String::new();
 
+	// The reader's range and conditional headers go upstream; a value that is not visible ASCII
+	// (none a browser sends for these) is dropped.
+	let forwarded: app_wire::Headers = ["Range", "If-Modified-Since", "Cache-Control"]
+		.into_iter()
+		.filter_map(|key| Some((key, req.headers().get(key)?.to_str().ok()?.to_string())))
+		.collect();
+
 	for attempt in 1..=MAX_ATTEMPTS {
-		let mut builder = CLIENT.get(wreq_uri.clone());
-
-		// Copy useful headers from original request
-		for &key in &["Range", "If-Modified-Since", "Cache-Control"] {
-			if let Some(value) = req.headers().get(key) {
-				builder = builder.header(key, value.as_bytes());
-			}
-		}
-
-		// Add User-Agent header of the currently spoofed device
-		{
-			let client = oauth_client().load_full();
-			builder = builder.header("User-Agent", client.user_agent());
-		}
-
-		// This is needed or Reddit will redirect us to a /media landing page that just renders the image.
-		builder = builder.header(wreq_header::ACCEPT, "*/*");
+		let headers = app_wire::media_headers(oauth_client().load().user_agent(), forwarded.clone());
+		let builder = app_wire::apply(OKHTTP.get(wreq_uri.clone()), headers);
 
 		let in_flight = upstream_log::start(upstream_log::Kind::Media, wreq_uri.host().unwrap_or_default());
 		let sent = builder.send().await;

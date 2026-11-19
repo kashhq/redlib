@@ -861,17 +861,6 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
-dependencies = [
- "cfg-if",
- "libc",
- "wasi",
-]
-
-[[package]]
-name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
@@ -1634,8 +1623,6 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
 dependencies = [
- "libc",
- "rand_chacha",
  "rand_core",
 ]
 
@@ -1654,13 +1641,10 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-dependencies = [
- "getrandom 0.2.17",
-]
 
 [[package]]
 name = "redlib"
-version = "0.44.7"
+version = "0.45.0"
 dependencies = [
  "arc-swap",
  "askama",
@@ -1668,6 +1652,7 @@ dependencies = [
  "base2048",
  "base64",
  "bincode",
+ "boring2",
  "brotli 7.0.0",
  "build_html",
  "cached",
@@ -1698,7 +1683,6 @@ dependencies = [
  "serde_json_path",
  "serde_urlencoded",
  "serde_yaml",
- "tegen",
  "time",
  "tokio",
  "toml",
@@ -2174,15 +2158,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tegen"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10a2d5a357b7c859b410139734a875136473c3b18b1bbd8d5bdc1769d9002acd"
-dependencies = [
- "rand",
 ]
 
 [[package]]

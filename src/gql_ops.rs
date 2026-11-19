@@ -85,7 +85,8 @@ const DUPLICATE_POSTS: Operation = Operation {
 
 const PAGE_SIZE: u32 = 25;
 
-/// The POST body of `op` with `variables`.
+/// The POST body of `op` with `variables`. A `Value` sorts its keys, so it is the in-process form
+/// (cache key, tests); `app_wire::gql_payload` writes it in the app's key order for the wire.
 pub(crate) fn body(op: &Operation, variables: Value) -> Value {
 	json!({
 		"operationName": op.name,
