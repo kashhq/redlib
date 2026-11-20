@@ -23,6 +23,10 @@
 # `--rules review_rules.sh` runs that script of main's the same way: `make review PR=<n>`
 # (bin/pr_review.sh), whose record counts as a review round, so a branch must not choose its own
 # reviewer either.
+# Pinned main (its .devkit-rev, nothing tracked under devkit/): main's own .devkit-bootstrap.sh
+# materializes main's pin into the temp dir, and that devkit/bin's rules decide; a refused pin or
+# devkit unreachable is exit 2. Vendored, main's bin/ is extracted with the bootstrap template
+# beside it (_vendor_paths.sh reads a pin's objects through it).
 # Exit: merge_rules.sh's (0 merged, 1 refused, 2 usage or environment, else gh's own code).
 set -uo pipefail
 
@@ -46,15 +50,26 @@ fetch_main "$ROOT" || { echo "merge: cannot fetch origin main, whose rules decid
 # The full ref: a local branch named origin/main would otherwise win.
 MAIN=$(git -C "$ROOT" rev-parse --verify -q refs/remotes/origin/main) \
   || { echo "merge: no origin/main after the fetch" >&2; exit 2; }
-if ! git -C "$ROOT" cat-file -e "$MAIN:${PREFIX}$RULES" 2>/dev/null; then
+PIN=$(git -C "$ROOT" show "$MAIN:.devkit-rev" 2>/dev/null) || PIN=''
+if [ -n "$PIN" ] && [ -n "$(git -C "$ROOT" ls-tree --name-only "$MAIN" -- devkit)" ]; then PIN=''; fi
+if [ -z "$PIN" ] && ! git -C "$ROOT" cat-file -e "$MAIN:${PREFIX}$RULES" 2>/dev/null; then
   echo "merge: origin/main ${MAIN:0:12} has no ${PREFIX}$RULES (its devkit predates main-decided rules); this checkout's rules decide"
   exec "$HERE/$RULES" "$ROOT" "$1"
 fi
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/devkit-merge.XXXXXX") || exit 2
 trap 'rm -rf "$TMP"' EXIT
-git -C "$ROOT" archive "$MAIN" -- "$PREFIX" | tar -x -C "$TMP" \
-  || { echo "merge: cannot extract ${PREFIX} of origin/main ${MAIN:0:12} (git above)" >&2; exit 2; }
+if [ -n "$PIN" ]; then
+  git -C "$ROOT" show "$MAIN:.devkit-bootstrap.sh" >"$TMP/bootstrap.sh" 2>/dev/null \
+    || { echo "merge: origin/main ${MAIN:0:12} pins devkit but has no .devkit-bootstrap.sh" >&2; exit 2; }
+  bash "$TMP/bootstrap.sh" --rev "${PIN%% *}" --tree "${PIN#* }" --into "$TMP/${PREFIX%/bin/}" \
+    || { echo "merge: cannot materialize origin/main ${MAIN:0:12}'s devkit ${PIN:0:7} (above)" >&2; exit 2; }
+else
+  # Main's bin/, and the bootstrap template when main has one (a pin's objects are read through it).
+  bootstrap=$(git -C "$ROOT" ls-tree --name-only "$MAIN" -- "${PREFIX%bin/}templates/bootstrap")
+  git -C "$ROOT" archive "$MAIN" -- "$PREFIX" ${bootstrap:+"$bootstrap"} | tar -x -C "$TMP" \
+    || { echo "merge: cannot extract ${PREFIX} of origin/main ${MAIN:0:12} (git above)" >&2; exit 2; }
+fi
 if [ -z "${GATE_PLAN:-}" ]; then
   git -C "$ROOT" show "$MAIN:scripts/ci/gate_plan.sh" >"$TMP/gate_plan.sh" 2>/dev/null \
     || { echo "merge: origin/main ${MAIN:0:12} has no scripts/ci/gate_plan.sh" >&2; exit 2; }

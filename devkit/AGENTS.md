@@ -1,6 +1,6 @@
 # devkit — agent rules
 
-Shared scripts vendored into every app repo by `bin/devkit-sync.sh` (only the paths in `VENDOR_PATHS`). Read `README.md` first.
+Shared scripts every app repo runs from `devkit/`, only the paths in `VENDOR_PATHS`: vendored by `bin/devkit-sync.sh`, or pinned in `.devkit-rev` and materialized by `.devkit-bootstrap.sh` (dual mode until the fleet migrates, `docs/plans/2026-11-13-stop-vendoring.md`). Read `README.md` first.
 
 **Purpose (owner, 2026-10-16): devkit is for agents.** Every mechanism here makes an agent's
 work cheaper (fewer tokens and turns per merged PR), faster (less wall-clock to a green gate) or
@@ -42,7 +42,10 @@ paths in `VENDOR_PATHS`); fleet operations in `github/`; `devkit new` scaffolds 
 is README.md "Architecture". Invariants of the design:
 - Output contracts are APIs. `bin/tier_guard.sh` prints `TIER <tier>: …|FAIL|FLOOR|OVERBUDGET|NOSHIFT …`
   and exits with the command's code, 1 for its own verdict, 2 for a bad call. `.devkit-rev` is `<upstream commit> <tree sha>`,
-  the tree filtered to `VENDOR_PATHS`. A new file consumers run must sit under a listed path.
+  the tree filtered to `VENDOR_PATHS`, whether `devkit/` is vendored or pinned. Every reader of a
+  consumer's `devkit/` handles both modes (`devkit_pinned`, `bin/_vendor_paths.sh`) and reaches a
+  pin's objects only through the bootstrap (`devkit_pin_git_dir`, `devkit_materialize`), never a
+  second cache path. A new file consumers run must sit under a listed path.
   The lint bases' exports are APIs too (`lint/exports.txt`): one leaves only after 30 days marked
   deprecated there, since repo-owned configs import them and devkit-sync cannot edit those.
   Every squash body's `Kind: product|tooling` and `Kind-By: label|kit|sync|bot` trailers
@@ -63,7 +66,7 @@ is README.md "Architecture". Invariants of the design:
   mechanic belongs here; a new check belongs in the repo's Makefile.
 - Every gate job is a Makefile target the repo's workflows also call. Parity is structural.
 - One version string per toolchain per repo: `.nvmrc`, `.python-version`, `rust-toolchain.toml`,
-  all exact. CI reads them (`*-version-file`). The gate (from the MERGED tree) and the hooks
+  all exact. CI reads them (`*-version-file`). Node is held by MAJOR (2026-11-13): a PATH node or a `FROM node:22.x` of the pin's major passes, only a download is exact. The gate (from the MERGED tree) and the hooks
   provision them through `toolchain_path.sh`, the one code path; never inline it again.
   `toolchain_check.sh` holds Dockerfiles, workflows and manifests to them. Never pin a
   toolchain version anywhere else. A package manager's pin is `package.json`'s `packageManager`
@@ -92,7 +95,7 @@ is README.md "Architecture". Invariants of the design:
   commit, never a red one, filing one `main-red` issue per first bad commit. Image inputs decide
   only the build: a green commit with none is `checked` (green recorded, `main-red` closed), never
   skipped unchecked. Only correctness fails a check: a flake is retried once
-  and files `flaky`; ratchets and budgets report or file issues, never fail it. `--ungated` is the
+  and files `flaky`; time budgets and floors report, never fail it, and the metrics ratchet is no job. `--ungated` is the
   owner's alone. Every plan declares `DEPLOY_KINDS=` (README "Deploy kinds"; the scorecard's
   `deploy_kinds`), so every kind the publisher does not prove is proven on the Mac. check_tree
   prints `CHECK <job> PASS|FAIL|REPORTED|SKIPPED …` and `CHECK VERDICT PASS|FAIL head=<sha>` (an
@@ -120,13 +123,14 @@ is README.md "Architecture". Invariants of the design:
   the oldest pending devkit commit is that old by the run's clock.
   An urgent devkit fix puts a line `Devkit-Sync: now` in its PR body (the squash commit message)
   to sync the fleet that night; never a line of its own otherwise. A consumer's `devkit-sync`
-  target, run by hand, syncs any time.
+  target, run by hand, syncs any time. In a pinned repo the sync is a one-line `.devkit-rev`
+  bump (plus a base copy when a template moved), merged unreviewed like a vendored one.
 - A launchd job runs devkit main's copy of itself: its plist starts the job dir's `launcher.sh`
   (`bin/job_launcher.sh`, installed by `bin/_launchd_job_lib.sh`), never a path in a checkout, so
   a devkit merge reaches the next run with no fast-forward. A new job goes through the same lib.
 - `bin/gate.sh` is the retired gate's stub (2026-11-02): one line naming `make review` and
   `make merge`, exit 0, so a consumer's old `gate` target never fails. Never grow it back.
-- The kit names roles, never hosts (owner 2026-11-12): its tree is vendored into public repos, so
+- The kit names roles, never hosts (owner 2026-11-12): its tree is vendored into, or materialized in, public repos, so
   "the publisher host", "the NAS", "the error tracker"; the real names and addresses live in the
   homelab repo. devkit-check's topology check fails a hit here (self-check, docs-check) and in any
   plan with `GATE_PUBLIC=1`, where docs_check.sh runs it too (a docs-only commit runs only
@@ -134,24 +138,26 @@ is README.md "Architecture". Invariants of the design:
   once, in `bin/_topology_lib.sh`, as generic shapes only (devkit #478): never add a fleet name,
   address or domain, since the lib ships in the public repos it guards and is scanned itself.
 - Fail loudly on a missing tool (`flock`, `gh`) with the install hint; never degrade silently.
-- Time budgets (a job's, a tier's) report and never fail (owner 2026-10-29); correctness (tests, floors,
-  ratchets) still fails. Never make a budget fail a PR again.
+- Time budgets (a job's, a tier's) report and never fail (owner 2026-10-29), and neither do
+  test-count floors or the metrics ratchet (owner 2026-11-13); correctness (tests, lint, guards)
+  still fails. Never make a budget, a floor or a metric fail a PR again.
 - Test work on the box queues in one place: `bin/_slot_lib.sh`'s pool at its fixed path, every
   tier and every check_tree job admitted for its cost. A new entry point that runs suites goes through it (`slot_acquire`),
   never its own lock. A job's cost is the table's (`_slot_word_cost`); a plan `GATE_JOB_COSTS`
   entry is for what the table misprices.
 - A pytest or vitest tier must not rot with real time: the plan reruns it shifted (`GATE_JOBS_CLOCK`, README
   "Clock shift"), and what a shift cannot reach is a `scripts/ci/clock_shift.conf` line with its reason.
-- `ci-metrics` is `bin/metrics_collect.sh` over the repo's `scripts/ci/metrics.conf`, run as
-  the gate's last job and nowhere else (not a hook, not Actions). Bounds never track `gate.*` or
-  `tier.*`; `tests.<tier>.<runner>` is the tier's floor, which tier_guard reads and tighten raises
-  (never a Makefile number); a collector that cannot run is exit 2, never a silent skip.
+- `ci-metrics` is `bin/metrics_collect.sh` over the repo's `scripts/ci/metrics.conf`, a report a
+  cleanup round runs by hand (owner 2026-11-13): no plan job, hook, label or Actions job, exit 0
+  whatever the numbers say. Bounds never track `gate.*` or `tier.*`; `tests.<tier>.<runner>` is the
+  tier's floor, which tier_guard reads and reports against and tighten raises (never a Makefile
+  number); a collector that cannot run is exit 2, never a silent skip.
 
 ## Commands
 ```sh
 make ci-quick                  # shellcheck, python + template unit tests (npm), devkit's own guards and ruff (ci-lint) on itself
 make ci-unit                   # bats tests/ (~2 min)
-make ci-metrics                # the ratchet over devkit's own shell (scripts/ci/metrics.conf, docs/metrics/ratchet.json)
+make ci-metrics                # the metrics report over devkit's own shell (scripts/ci/metrics.conf, docs/metrics/ratchet.json)
 make review PR=<n>             # one local review round: claude -p over the diff, its record posted on the PR
 make merge PR=<n>              # squash-merge once the review rounds allow it (DEVKIT_REVIEW_ROUNDS, default 3)
 bin/docs_check.sh --report .   # the docs numbers behind the diet rules; --fix does the mechanical moves

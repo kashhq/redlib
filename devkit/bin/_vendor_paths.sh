@@ -8,6 +8,33 @@
 # Every function reading tracked files takes <rev>: a commit, or "" for the index (the hooks and
 # devkit-sync judge what is staged; pr_merge.sh and the nightly sync judge a PR's head).
 #
+# Two modes, per tree, until the last consumer migrates (devkit docs/plans/2026-11-13-stop-vendoring.md):
+# VENDORED tracks devkit/ (its tree is .devkit-rev's); PINNED tracks only .devkit-rev and
+# .devkit-bootstrap.sh, and devkit/ is an untracked directory the bootstrap materializes. A pin's
+# own objects (its tree, its base copies' blobs) are read from the bootstrap's cache, never the
+# consumer's object store, through this devkit's copy of the bootstrap (devkit_pin_git_dir).
+#
+#   devkit_pinned [<rev>]
+#       True when <rev> records .devkit-rev and tracks nothing under devkit/: the pinned mode.
+#
+#   devkit_pin_git_dir <commit>
+#       Print the cache's git dir once <commit> is in it (the bootstrap's --git-dir: it may
+#       fetch; offline and uncached is its exit 2, passed on).
+#
+#   devkit_materialize <checkout>
+#       In a pinned checkout, fill <checkout>/devkit from its .devkit-rev with this devkit's
+#       bootstrap, as its own make would; a vendored one (or one without .devkit-rev) is left as
+#       it is. Exit: 0, 1 the pin is refused (the commit's), 2 anything else (the box: devkit
+#       unreachable, this devkit without its bootstrap, the bootstrap killed or not runnable).
+#       Used by check_tree.sh, publish.sh's build and the nightly sync's worktrees.
+#
+#   devkit_pin_paths <old rev> <new rev>
+#       "devkit/<path>", one per line, for each path the two pins' trees differ in, when <new
+#       rev> is pinned and moved .devkit-rev: what a pin bump changes under devkit/, so a path
+#       classifier (_paths_lib.sh) sees the devkit files a one-line bump moves. Nothing when
+#       <old rev> is vendored: its devkit/ paths are already in the diff, as deletions. When <old rev>'s
+#       pin is a commit devkit no longer has (bootstrap exit 1), every path of <new rev>'s tree.
+#
 #   DEVKIT_URL
 #       Upstream, where devkit-sync fetches from (overridable, as tests do).
 #
@@ -24,7 +51,9 @@
 #       "<base path in devkit> <repo path>" for each tracked file that must be a byte copy of a
 #       vendored base: every swift_format_copies line, and .githooks/<hook> for each hook in
 #       templates/githooks (the monthly audit's hook-differs), tracked or not once the repo
-#       tracks any of them (devkit-sync.sh then creates it). Read by devkit-sync.sh.
+#       tracks any of them (devkit-sync.sh then creates it); pinned, .devkit-bootstrap.sh too.
+#       The hook names come from devkit/ in a vendored tree, the pin's commit in the cache in a
+#       pinned one. Read by devkit-sync.sh.
 #
 #   vendor_filter_tree <tree> <manifest text>
 #       Print the hash of a tree holding only <tree>'s entries under the manifest's paths (modes,
@@ -40,6 +69,8 @@
 #       True when <paths> (one per line) only vendor devkit at <rev>, as devkit-sync's own
 #       commit does: every path is under devkit/, is .devkit-rev, or is a base copy
 #       byte-identical to its base at <rev> and of its mode (a chmod -x of a hook copy disables it), and devkit/ at <rev> is the tree .devkit-rev records.
+#       Pinned ("pin only"): every path is .devkit-rev or a base copy equal to its base at the
+#       pinned commit, and the pinned tree is that commit's filtered tree (both in the cache).
 #       Sets VENDORED_TREE. A hand edit under devkit/ breaks the hash; it proves nothing about
 #       where the tree came from (vendored_from does).
 #
@@ -64,6 +95,11 @@ DEVKIT_URL=${DEVKIT_URL:-https://github.com/kashhq/devkit.git}
 VENDOR_SYNC_BOUNDS=docs/metrics/ratchet.json
 # Resolved now: callers run these functions from inside a subshell that cd'd to the repo.
 _VENDOR_PATHS_BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# This devkit's bootstrap (VENDOR_PATHS lists templates/bootstrap; pr_merge.sh extracts it beside
+# main's bin/), whose bytes every pinned consumer's .devkit-bootstrap.sh holds.
+DEVKIT_BOOTSTRAP=$_VENDOR_PATHS_BIN/../templates/bootstrap/devkit-bootstrap.sh
+BOOTSTRAP_BASE=templates/bootstrap/devkit-bootstrap.sh
+BOOTSTRAP_COPY=.devkit-bootstrap.sh
 
 vendor_filter_tree() { # <tree> <manifest text>
   local tree=$1 line path index status=0
@@ -109,21 +145,81 @@ _vendor_files() {
   if [ -z "$1" ]; then git ls-files; else git ls-tree -r --name-only "$1"; fi
 }
 
+# _vendor_record <rev>: .devkit-rev's line at <rev> (the index for "").
+_vendor_record() { git show "${1:-}:.devkit-rev" 2>/dev/null; }
+
+devkit_pinned() { # [<rev>]
+  _vendor_record "${1:-}" >/dev/null || return 1
+  if [ -z "${1:-}" ]; then
+    [ -z "$(git ls-files -- devkit | head -1)" ]
+  else
+    [ -z "$(git ls-tree --name-only "$1" -- devkit)" ]
+  fi
+}
+
+devkit_pin_git_dir() { # <commit>
+  bash "$DEVKIT_BOOTSTRAP" --git-dir --rev "$1"
+}
+
+devkit_materialize() { # <checkout>
+  local record rc=0
+  [ -z "$(git -C "$1" ls-files -- devkit | head -1)" ] || return 0
+  record=$(git -C "$1" show HEAD:.devkit-rev 2>/dev/null) || return 0
+  [ -f "$DEVKIT_BOOTSTRAP" ] || {
+    echo "devkit: this devkit ($_VENDOR_PATHS_BIN) has no ../$BOOTSTRAP_BASE, so it cannot materialize a pin" >&2
+    return 2
+  }
+  bash "$DEVKIT_BOOTSTRAP" --rev "${record%% *}" --tree "${record#* }" --into "$1/devkit" || rc=$?
+  # Only the bootstrap's own refusal (1) is the commit's; it not running at all is the box's.
+  case $rc in 0|1) return "$rc" ;; *) return 2 ;; esac
+}
+
+devkit_pin_paths() { # <old rev> <new rev>
+  local old new gd old_tree new_tree rc=0
+  devkit_pinned "$2" && devkit_pinned "$1" || return 0
+  old=$(_vendor_record "$1") && new=$(_vendor_record "$2") || return 1
+  [ "$old" != "$new" ] || return 0
+  gd=$(devkit_pin_git_dir "${new%% *}") || return 1
+  # The old pin is the last published commit's, fixed: a devkit that no longer has it (a
+  # force-pushed branch) would fail here every cycle and stall publishing. Confirmed gone (the
+  # bootstrap's 1) means every devkit path may have changed; any other failure is the box's.
+  gd=$(devkit_pin_git_dir "${old%% *}") || rc=$?
+  if [ "$rc" = 1 ]; then
+    echo "devkit: ${old%% *} (the old pin) is gone from devkit; counting every devkit/ path as changed" >&2
+    gd=$(devkit_pin_git_dir "${new%% *}") || return 1
+    new_tree=$(GIT_DIR=$gd vendor_tree_of "${new%% *}") || return 1
+    GIT_DIR=$gd git ls-tree -r --name-only "$new_tree" | sed 's|^|devkit/|'
+    return 0
+  fi
+  [ "$rc" = 0 ] || return "$rc"
+  # The commits' filtered trees, as each pin records them (vendor_tree_of writes them into the
+  # cache, where the bootstrap only ever hashed them in a scratch store).
+  old_tree=$(GIT_DIR=$gd vendor_tree_of "${old%% *}") && new_tree=$(GIT_DIR=$gd vendor_tree_of "${new%% *}") || return 1
+  GIT_DIR=$gd git diff-tree -r --no-renames --name-only "$old_tree" "$new_tree" | sed 's|^|devkit/|'
+}
+
 swift_format_copies() { # [<rev>]
   _vendor_files "${1:-}" | awk '/(^|\/)\.swift-format$/'
 }
 
 base_copies() { # [<rev>]
-  local rev=${1:-} files copy hook
+  local rev=${1:-} files copy hook record gd
   while IFS= read -r copy; do
     [ -z "$copy" ] || echo "lint/swift-format.json $copy"
   done <<<"$(swift_format_copies "$rev")"
   # The template names come from the repo's own vendored devkit/ (in the index, the tree a sync
-  # has just replaced). A repo that tracks one hook copy has adopted the hooks, so a hook upstream
-  # adds is listed too and the sync creates it; a repo with none gets none.
+  # has just replaced), or its pin's commit in the cache. A repo that tracks one hook copy has
+  # adopted the hooks, so a hook upstream adds is listed too and the sync creates it; a repo with
+  # none gets none.
   local templates adopted=0
   files=$(_vendor_files "$rev")
-  templates=$(awk '/^devkit\/templates\/githooks\//' <<<"$files")
+  if devkit_pinned "$rev"; then
+    echo "$BOOTSTRAP_BASE $BOOTSTRAP_COPY"
+    record=$(_vendor_record "$rev") && gd=$(devkit_pin_git_dir "${record%% *}") || return 1
+    templates=$(GIT_DIR=$gd git ls-tree --name-only "${record%% *}" -- templates/githooks/)
+  else
+    templates=$(awk '/^devkit\/templates\/githooks\//' <<<"$files")
+  fi
   while IFS= read -r hook; do
     [ -n "$hook" ] || continue
     ! grep -qxF -- ".githooks/${hook##*/}" <<<"$files" || adopted=1
@@ -145,23 +241,31 @@ vendor_tree_of() { # <commit>
 }
 
 vendoring_only() { # <rev> <paths>
-  local rev=$1 record path base bases copy
+  local rev=$1 record path base bases copy gd=''
   VENDORED_TREE=
   [ -n "$2" ] || return 1
-  record=$(git show "$rev:.devkit-rev" 2>/dev/null) || return 1
-  if [ -z "$rev" ]; then
+  record=$(_vendor_record "$rev") || return 1
+  if devkit_pinned "$rev"; then
+    gd=$(devkit_pin_git_dir "${record%% *}") || return 1
+    VENDORED_TREE=$(GIT_DIR=$gd vendor_tree_of "${record%% *}" 2>/dev/null) || return 1
+  elif [ -z "$rev" ]; then
     VENDORED_TREE=$(git write-tree --prefix=devkit/ 2>/dev/null) || return 1
   else
     VENDORED_TREE=$(git rev-parse -q --verify "$rev:devkit") || return 1
   fi
   [ "$VENDORED_TREE" = "${record#* }" ] || return 1
-  bases=$(base_copies "$rev")
+  bases=$(base_copies "$rev") || return 1
   while IFS= read -r path; do
-    case "$path" in ''|devkit/*|.devkit-rev) continue ;; esac
+    case "$path" in ''|.devkit-rev) continue ;; devkit/*) [ -z "$gd" ] && continue; return 1 ;; esac
     base=$(awk -v c="$path" '$2 == c { print $1; exit }' <<<"$bases")
     [ -n "$base" ] || return 1
     copy=$(_vendor_entry "$rev" "$path")
-    [ -n "$copy" ] && [ "$copy" = "$(_vendor_entry "$rev" "devkit/$base")" ] || return 1
+    [ -n "$copy" ] || return 1
+    if [ -n "$gd" ]; then
+      [ "$copy" = "$(GIT_DIR=$gd _vendor_entry "${record%% *}" "$base")" ] || return 1
+    else
+      [ "$copy" = "$(_vendor_entry "$rev" "devkit/$base")" ] || return 1
+    fi
   done <<<"$2"
 }
 
