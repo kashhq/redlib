@@ -28,7 +28,8 @@
 #     `docs` in _paths_lib.sh's table (paths decide, never a label), or a devkit sync: every
 #     changed path only vendors devkit at its head (_vendor_paths.sh devkit_sync_only) from a
 #     commit on devkit's main forward of main's vendored one (vendored_from), devkit's own code,
-#     reviewed there. Neither holds for a PR with no changed files, or one whose files GitHub
+#     reviewed there. In a pinned repo that is a pin bump: only .devkit-rev, base copies (the
+#     bootstrap among them) and tightened bounds, the pin's tree its commit's (in the cache). Neither holds for a PR with no changed files, or one whose files GitHub
 #     listed short of `changedFiles` (the API stops at 3000);
 #   - every other context the plan's literal `GATE_MERGE_REQUIRES=<context>[,…]` names is success
 #     on the head. `codex-review` (closet's, which its GitHub protection requires; Codex posts no
@@ -63,9 +64,6 @@
 # above still holds. Why (owner, 2026-11-02): an escape hatch only a person can open.
 # CODEX_FALLBACK=1 is gone (exit 2): `make review PR=<n>` is the round Codex could not give.
 # A draft that passes is marked ready (`gh pr ready`), then merged: GitHub refuses a draft.
-# A PR labelled metrics-rebaseline gets one `Metrics-Rebaseline: <key>=<old>→<new>` trailer per
-# bound its head loosens in docs/metrics/ratchet.json against main (metrics_ratchet.py loosened)
-# in the squash body: the label is not in git, the trailer is (instalite 2026-10-19).
 # Every squash body carries one `Kind: product|tooling` trailer, the scorecard's OUTPUT readout
 # (owner 2026-11-04: the share of the fleet's work that is product), and `Kind-By: <rule>`, the
 # rule that decided it: `kit` (tooling) when the plan has the literal `GATE_KIT=1` (devkit,
@@ -267,7 +265,7 @@ sync_exempt() {
   upstream=$(fetch_devkit_main "$ROOT") \
     || { echo "merge: cannot fetch devkit's main from $DEVKIT_URL (git above)" >&2; exit 2; }
   (cd "$ROOT" && devkit_sync_only "$head" "$(git merge-base "$head" "$main_now")" "$touched") \
-    || { not_sync="a path other than devkit/, .devkit-rev, byte-equal base copies and tightened bounds, or a devkit/ that is not the tree its .devkit-rev records"; return 1; }
+    || { not_sync="a path other than .devkit-rev, byte-equal base copies, tightened bounds and (vendored) devkit/, or a devkit/ (vendored) or pin (pinned) that is not the tree its .devkit-rev records"; return 1; }
   (cd "$ROOT" && vendored_from "$head" "$upstream" "$main_now") \
     || { not_sync="its .devkit-rev names no commit on devkit main, forward of main's, whose vendored tree it records"; return 1; }
 }
@@ -470,26 +468,8 @@ resolve_conflict() {
 settle_mergeable
 [ "$mergeable" != CONFLICTING ] || resolve_conflict
 
-readonly BOUNDS=docs/metrics/ratchet.json
-trailers=""
-case ",$labels," in
-  *,metrics-rebaseline,*)
-    fetch_main "$ROOT" "pull/$PR/head" \
-      || { echo "merge: cannot fetch PR #$PR's head and main to read its loosened bounds (git above)" >&2; exit 2; }
-    loosened=$("$DEVKIT_PYTHON" -I "$HERE/metrics_ratchet.py" loosened --repo "$ROOT" --bounds "$BOUNDS" \
-      --base-ref "$main_now" --head-ref "$head") \
-      || { echo "merge: cannot compare $BOUNDS at ${head:0:12} with main (python above)" >&2; exit 2; }
-    if [ -n "$loosened" ]; then
-      trailers=$(awk '{ print "Metrics-Rebaseline: " $0 }' <<<"$loosened")
-      echo "merge: PR #$PR carries metrics-rebaseline; the squash body names what it loosens: $(paste -sd ' ' - <<<"$loosened")"
-    else
-      echo "merge: PR #$PR carries metrics-rebaseline but loosens no bound in $BOUNDS; no trailer"
-    fi
-    ;;
-esac
-
 nl=$'\n'
-trailers="${trailers:+$trailers$nl}Kind: $kind${nl}Kind-By: $kind_by"
+trailers="Kind: $kind${nl}Kind-By: $kind_by"
 # The commits' subjects (the body of a PR with none) and co-authors (header), in one read.
 # shellcheck disable=SC2016  # jq's $a and \(…), not the shell's
 commit_lines=$(gh pr view "$PR" --repo "$SLUG" --json author,commits --jq '.author.login as $a | .commits[]

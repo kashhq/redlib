@@ -61,7 +61,10 @@
 #      run for (devkit_image_inputs_changed: main's .dockerignore and plan GATE_IMAGE_* lines)
 #      is `checked`, P becomes the green record, and nothing is built, so a docs merge redeploys
 #      nothing. --ungated has checked nothing, so it records nothing and is skipped there.
-#   6. `make ci-image`, then `make ci-smoke`, in a fresh worktree at P with
+#      A pinned P's .devkit-rev change counts as the devkit/ paths the two pins' trees differ
+#      in (_vendor_paths.sh devkit_pin_paths), as a vendored diff lists them.
+#   6. `make ci-image`, then `make ci-smoke`, in a fresh worktree at P (its pinned devkit/
+#      materialized first, devkit_materialize) with
 #      CI_IMAGE=<image>:sha-<7> CI_BUILD_VERSION=<7>: never a check image (its version is
 #      check-<pid>), and nothing reaches the registry unless it booted reporting <7>.
 #   7. Push sha-<7>; re-read `latest` and refuse if it moved since step 3 (a second mover); then
@@ -78,6 +81,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$HERE/_issue_lib.sh"
 # shellcheck source=bin/_paths_lib.sh  # devkit_image_inputs_changed
 . "$HERE/_paths_lib.sh"
+# shellcheck source=bin/_vendor_paths.sh  # devkit_materialize, devkit_pin_paths
+. "$HERE/_vendor_paths.sh"
 # shellcheck source=bin/_timeout_lib.sh  # devkit_docker_check, devkit_docker_guard
 . "$HERE/_timeout_lib.sh"
 # shellcheck source=bin/_load_lib.sh  # devkit_epoch, the window's clock
@@ -234,9 +239,14 @@ judge_position() {
 # Step 5 (header), after pick_commit: SHA7 is P's. Judged against main's plan and .dockerignore,
 # as the gate's IMAGE group is.
 judge_inputs() {
-  local changed n rc=0
+  local changed pin_paths n rc=0
   [ -n "$L" ] || return 0
   changed=$(git -C "$ROOT" diff --no-renames --name-only "$L" "$P") || fail "git diff ${L:0:7} $SHA7 failed"
+  # A pinned bump is one line of .devkit-rev; what it moves under devkit/ is classified too, so a
+  # bump that changes an image bin (release_check.sh) still rebuilds.
+  pin_paths=$(cd "$ROOT" && devkit_pin_paths "$L" "$P") \
+    || env_error "cannot list what ${L:0:7}..$SHA7's devkit pin bump changes (above)"
+  [ -z "$pin_paths" ] || changed+=$'\n'$pin_paths
   n=$(grep -c . <<<"$changed")
   devkit_image_inputs_changed "$SCRATCH/tree" "$changed" || rc=$?
   case $rc in
@@ -366,12 +376,19 @@ in_worktree_make() { # <target> <tag>
 
 # Step 6 (header).
 build_image() {
-  local tag=$IMAGE:sha-$SHA7 built
+  local tag=$IMAGE:sha-$SHA7 built rc=0
   BUILD_WT=$STATE/$NAME.wt
   git -C "$ROOT" worktree remove --force "$BUILD_WT" >/dev/null 2>&1
   rm -rf "$BUILD_WT"
   git -C "$ROOT" worktree prune
   git -C "$ROOT" worktree add -q --detach "$BUILD_WT" "$P" || fail "git worktree add at $SHA7 failed (above)"
+  # P's own devkit/ when it is pinned (check_tree did the same in its own worktree).
+  devkit_materialize "$BUILD_WT" || rc=$?
+  case $rc in
+    0) ;;
+    1) fail "$SHA7's pinned devkit is refused (above); nothing was built" ;;
+    *) env_error "cannot materialize $SHA7's pinned devkit (above): the box, not the commit" ;;
+  esac
   echo "PUBLISH build: make ci-image, then ci-smoke, CI_IMAGE=$tag CI_BUILD_VERSION=$SHA7"
   BUILT_TAG=$tag
   # Two make calls, never one with both goals: under an inherited -j they would run at once and

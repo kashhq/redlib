@@ -403,7 +403,7 @@ handle_pr() {
 sync_body() {
   local titles
   printf 'Nightly devkit sync (devkit/bin/dependency_merge.sh): `devkit-sync.sh` from %s to %s, the newest devkit main the Mac'"'"'s main check passed (`main-check` green). ' "${1:0:7}" "${2:0:7}"
-  printf 'It only vendors (devkit/, .devkit-rev, base copies) code reviewed on devkit main, so `make merge` '
+  printf 'It only moves the devkit pin (.devkit-rev, base copies; devkit/ itself where it is vendored) to code reviewed on devkit main, so `make merge` '
   printf 'asks no review of it (merge_rules.sh); its effect on this repo is judged before a deploy.\n\n'
   printf 'Devkit commits %s..%s:\n' "${1:0:7}" "${2:0:7}"
   # GitHub refuses a body over 65536 characters; a repo far behind lists the newest 50.
@@ -490,7 +490,8 @@ push_sync() {
     || { SYNC_WT=""; record "$SLUG" error "cannot add a worktree of main for the sync; see $log"; return 1; }
   # The repo's own script, as its `make devkit-sync` recipe runs it, with the ref that recipe has
   # no way to pass: every vendored copy takes one (and re-execs the copy it vendors with it).
-  (cd "$SYNC_WT" && DEVKIT_COMMIT_TRAILER=$DEVKIT_DEFAULT_TRAILER devkit/bin/devkit-sync.sh "$SYNC_UPSTREAM") >>"$log" 2>&1 8>&- \
+  # A pinned repo's worktree has no devkit/ until its pin is materialized (exit 2: devkit unreachable).
+  (cd "$SYNC_WT" && devkit_materialize . && DEVKIT_COMMIT_TRAILER=$DEVKIT_DEFAULT_TRAILER devkit/bin/devkit-sync.sh "$SYNC_UPSTREAM") >>"$log" 2>&1 8>&- \
     || { record "$SLUG" error "devkit-sync.sh ${SYNC_UPSTREAM:0:7} failed (a conflict or a refused commit), not forced; see $log"; return 1; }
   SYNC_NEW=$(cut -d' ' -f1 "$SYNC_WT/.devkit-rev")
   [ "$SYNC_NEW" = "$SYNC_UPSTREAM" ] \
@@ -504,7 +505,7 @@ push_sync() {
   upstream=$(net fetch_devkit_main "$SYNC_WT") \
     || { record_fail "$SLUG" $? error "cannot fetch devkit's main from $DEVKIT_URL (git above)"; return 1; }
   (cd "$SYNC_WT" && devkit_sync_only HEAD "$main" "$paths" && vendored_from HEAD "$upstream" "$main") || {
-    record "$SLUG" refused "the sync is not vendoring only (outside devkit/: $(grep -v '^devkit/' <<<"$paths" | paste -sd ' ' -)); not pushed"
+    record "$SLUG" refused "the sync is not vendoring only (outside devkit/ and .devkit-rev: $(grep -v -e '^devkit/' -e '^\.devkit-rev$' <<<"$paths" | paste -sd ' ' -)); not pushed"
     return 1
   }
   local lease=$2 branch=$SYNC_LABEL/${SYNC_NEW:0:7} there

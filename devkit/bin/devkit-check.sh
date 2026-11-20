@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
-# Guard: the vendored devkit/ tree is exactly what devkit-sync.sh recorded in .devkit-rev.
+# Guard: the devkit/ tree, vendored or pinned, is exactly what devkit-sync.sh recorded in .devkit-rev.
 # Runs in ci-quick; offline, milliseconds. A diff means someone edited devkit/ in this repo.
 # Usage: devkit/bin/devkit-check.sh [--staged]        or: make devkit-check
 #
 # Also: a tree that matches .devkit-rev but holds paths outside its own VENDOR_PATHS was vendored
 # whole by a devkit-sync older than the manifest (the first `make devkit-sync` after 2026-10-13
 # runs the old script). Rerunning make devkit-sync, now the new script, slims it.
+#
+# Pinned (dual mode until the last consumer migrates, devkit docs/plans/2026-11-13-stop-vendoring.md):
+# a repo tracking .devkit-rev and nothing under devkit/ instead has its untracked devkit/ hashed
+# by the bootstrap's --check (the pinned tree, and the stamp naming the pin), so a local edit
+# under devkit/ fails as it does vendored. Also, pinned: devkit/ is gitignored (else the next
+# `git add -A` vendors it back) and so are the bootstrap's lock and swap temporaries (/devkit.*),
+# .devkit-bootstrap.sh is byte-equal to the pinned
+# templates/bootstrap/devkit-bootstrap.sh (its mode too), and the Makefile has the materialize
+# stanza (`include devkit/.devkit-materialized.mk` and its rule; the bootstrap's header), without
+# which a fresh worktree's make finds no devkit/bin. The rule lines are matched exactly (an older
+# stanza fails with the replacement text), so a sync brings consumers onto the self-healing one.
 #
 # Also: every tracked .swift-format must equal devkit/lint/swift-format.json byte for byte.
 #
@@ -32,9 +43,8 @@
 # no scorecard.json, 2026-10-23), each named with the one command that creates it
 # (baseline_file): docs/metrics/scorecard.json, the WIRED ratchet's record, which ci-metrics
 # skips when absent, and docs/metrics/ratchet.json where scripts/ci/metrics.conf declares
-# collectors. A warning before BASELINE_FAILS_FROM, a failure from it (docs_check's scheme), so
-# the sync that brings the rule breaks no consumer's ci-quick. DEVKIT_CHECK_TODAY overrides
-# today (tests). The docs set, hooks, Renovate and the gate plan have their own checks.
+# collectors. A warning only (owner 2026-11-13; metrics are report-only). DEVKIT_CHECK_TODAY
+# overrides today (tests, the retired-owner date). The docs set, hooks, Renovate and the gate plan have their own checks.
 #
 # Also: no tracked file outside devkit/, docs/decisions.md, docs/reports/ and docs/audits/ names
 # a retired GitHub owner (DEVKIT_RETIRED_OWNERS; agandhi4 became kashhq on 2026-11-12). A slug,
@@ -155,6 +165,10 @@ esac
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
 HERE=$(dirname "${BASH_SOURCE[0]}")
+# The mode (header) and the kit this repo runs: devkit/, materialized when pinned.
+KIT=$ROOT/devkit
+PINNED=0
+! devkit_pinned "" || PINNED=1
 warn() { echo "devkit-check: WARNING: $*" >&2; }
 # Former GitHub owners of these repos (space-separated, compared without case as GitHub does):
 # check_retired_owner fails a file naming one, check_clone_config only warns on an origin still
@@ -199,6 +213,7 @@ check_vendored_tree() {
     exit 1
   }
   read -r _commit expected <<<"$rev"
+  if [ "$PINNED" = 1 ]; then check_pinned_tree; return; fi
   actual=$(git write-tree --prefix=devkit/ 2>/dev/null) || {
     echo "devkit-check: cannot read devkit/ from the index (missing or unmerged); run make devkit-sync" >&2
     exit 1
@@ -217,6 +232,48 @@ check_vendored_tree() {
     fi
   fi
 }
+# The pinned form of check_vendored_tree (header): the working devkit/, since nothing under it
+# is tracked; the bootstrap copy from the index, like .devkit-rev; the Makefile as --staged says.
+check_pinned_tree() {
+  local base copy mk tmp
+  git check-ignore -q --no-index devkit/ || {
+    echo "devkit-check: devkit/ is pinned (.devkit-rev, nothing tracked under it) but not gitignored; add /devkit/ to .gitignore" >&2
+    exit 1
+  }
+  # The bootstrap's lock and swap temporaries sit beside devkit/; a killed run leaves them, and an
+  # unignored one is ~150 files for `git add -A`.
+  for tmp in devkit.lock/pid devkit.tmp.1/bin/x devkit.old.1/bin/x; do
+    git check-ignore -q --no-index "$tmp" || {
+      echo "devkit-check: the bootstrap's lock and swap temporaries (devkit.lock, devkit.tmp.<pid>, devkit.old.<pid>) are not gitignored; add /devkit.* to .gitignore" >&2
+      exit 1
+    }
+  done
+  bash "$KIT/templates/bootstrap/devkit-bootstrap.sh" --check --rev "$_commit" --tree "$expected" --into "$KIT" \
+    || { echo "devkit-check: devkit/ is not the pinned ${_commit:0:7} (above)" >&2; exit 1; }
+  base=$(git hash-object "$KIT/$BOOTSTRAP_BASE") || exit 1
+  if [ -x "$KIT/$BOOTSTRAP_BASE" ]; then base="100755 $base"; else base="100644 $base"; fi
+  copy=$(_vendor_entry "" "$BOOTSTRAP_COPY")
+  [ "$copy" = "$base" ] || {
+    echo "devkit-check: $BOOTSTRAP_COPY differs from devkit/$BOOTSTRAP_BASE (or is missing, or not executable); restore it: make devkit-sync" >&2
+    exit 1
+  }
+  mk=$(tracked_text Makefile)
+  if ! grep -qE '^include devkit/\.devkit-materialized\.mk[[:space:]]*$' <<<"$mk" \
+    || ! grep -qxF 'devkit/.devkit-materialized.mk: .devkit-rev .devkit-bootstrap.sh devkit/.devkit-materialized ; @./.devkit-bootstrap.sh && touch $@' <<<"$mk" \
+    || ! grep -qxF 'devkit/.devkit-materialized: ;' <<<"$mk"; then
+    echo "devkit-check: Makefile lacks the materialize stanza, so a fresh worktree's make finds no devkit/ (devkit/$BOOTSTRAP_BASE header):" >&2
+    sed -n '/^# Make, at the top/,/^# Exit:/p' "$KIT/$BOOTSTRAP_BASE" | sed '1d;$d; s/^#  */  /' >&2
+    exit 1
+  fi
+}
+# kit_text / kit_blob <path in devkit>: that file of the kit this repo runs (the index's when
+# vendored), its text or its blob id.
+kit_text() {
+  if [ "$PINNED" = 1 ]; then cat "$KIT/$1" 2>/dev/null; else git show ":devkit/$1" 2>/dev/null; fi
+}
+kit_blob() {
+  if [ "$PINNED" = 1 ]; then [ -f "$KIT/$1" ] && git hash-object "$KIT/$1"; else git rev-parse -q --verify ":devkit/$1" 2>/dev/null; fi
+}
 # swift-format has no `extends`, so a repo's .swift-format (root or nested, e.g. ios/) is a copy of
 # devkit/lint/swift-format.json and this is what keeps the copies one base. Index blobs, like the
 # tree check: equal blob ids are equal bytes.
@@ -225,7 +282,7 @@ check_swift_format() {
   while IFS= read -r copy; do
     [ -n "$copy" ] || continue
     if [ -z "$base_blob" ]; then
-      base_blob=$(git rev-parse -q --verify ":devkit/lint/swift-format.json" 2>/dev/null) || {
+      base_blob=$(kit_blob lint/swift-format.json) || {
         echo "devkit-check: $copy exists but devkit/lint/swift-format.json does not; run make devkit-sync" >&2
         exit 1
       }
@@ -350,27 +407,20 @@ check_clone_config() {
   echo "devkit-check: scripts/ci/gate_plan.sh: GATE_SLUG=$plan_slug is not origin's repo ($origin); the gate and make merge act on GATE_SLUG, so set it to origin's" >&2
   exit 1
 }
-# baseline_file <path> <the command that creates it> <why>: the header's warn-then-fail rule. The
-# index under --staged, else the working tree, as the plan is read.
-readonly BASELINE_FAILS_FROM=2026-11-01
-baseline_missing=0
+# baseline_file <path> <the command that creates it> <why>: a warning, never a failure (owner
+# 2026-11-13: the ratchet is a cleanup-round report, so a missing record blocks no PR). The index
+# under --staged, else the working tree, as the plan is read.
 baseline_file() {
   tracked_exists "$1" && return 0
-  if [[ "${DEVKIT_CHECK_TODAY:-$(date +%F)}" < "$BASELINE_FAILS_FROM" ]]; then
-    warn "no $1 ($3); create it with \`$2\` and commit it (fails from $BASELINE_FAILS_FROM)"
-  else
-    echo "devkit-check: no $1 ($3); create it with \`$2\` and commit it" >&2
-    baseline_missing=1
-  fi
+  warn "no $1 ($3); create it with \`$2\` and commit it to run a cleanup round"
 }
 check_baselines() {
   baseline_file docs/metrics/scorecard.json 'devkit/bin/python.sh -I devkit/bin/scorecard.py . --mode rebaseline' \
-    "the WIRED ratchet's record, which devkit new writes; ci-metrics holds no check without it"
+    "the WIRED ratchet's record, which devkit new writes; make ci-metrics reports nothing without it"
   if tracked_exists scripts/ci/metrics.conf; then
     baseline_file docs/metrics/ratchet.json 'make metrics-rebaseline' \
-      "the bounds scripts/ci/metrics.conf's collectors are held to; ci-metrics cannot run without it"
+      "the bounds scripts/ci/metrics.conf's collectors are reported against"
   fi
-  [ "$baseline_missing" = 0 ] || exit 1
 }
 check_tsbuildinfo() {
   git ls-files --error-unmatch .dockerignore >/dev/null 2>&1 || return 0
@@ -554,7 +604,7 @@ check_deprecated_exports() {
       _devkit_area "$file"
       [ "$DEVKIT_AREA" = docs ] || warn "$file: $name (devkit/lint/$module) is deprecated since $since; $migration"
     done <<<"$(git grep "${grep_args[@]}" -e "$name" -e "devkit/lint/$module" -- ':!devkit/' || true)"
-  done <<<"$(git show :devkit/lint/exports.txt 2>/dev/null | grep -v '^#' || true)"
+  done <<<"$(kit_text lint/exports.txt | grep -v '^#' || true)"
 }
 
 # A devkit checkout has no vendored tree, plan or Makefile contract to judge: the topology check

@@ -53,6 +53,12 @@
 # gh's default repo likewise becomes origin (gh_default_heal, bin/_gh_repo_lib.sh): a fork's bare
 # gh resolves to its parent (redlib, 2026-10-26).
 #
+# Pinned mode (a repo tracking .devkit-bootstrap.sh and nothing under devkit/; devkit docs/plans/
+# 2026-11-13-stop-vendoring.md): the same steps, but the sync never stages devkit/. It writes
+# .devkit-rev and the new commit's bootstrap, materializes devkit/ with that bootstrap (the pin's
+# tree is checked there), re-execs the materialized devkit-sync.sh, and commits the pin and the
+# base copies alone: a bump is one line, plus a base copy when a template moved.
+#
 # Hooks: the sync's commit only vendors (devkit/ at .devkit-rev's tree, base copies), so the
 # repo's pre-commit runs none of its steps for it (hook_steps.sh _hook_vendoring_only) and the
 # sync commits in a fresh worktree before any install (closet, 2026-10-19).
@@ -82,9 +88,14 @@ done
 REF=${REF:-main}
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
+PINNED=0
+if git ls-files --error-unmatch -- "$BOOTSTRAP_COPY" >/dev/null 2>&1 && [ -z "$(git ls-files -- devkit | head -1)" ]; then
+  PINNED=1
+fi
 # --stage leaves the sync in the index, so the index may already hold the caller's files; a
 # committing sync must start clean or its commit would sweep unrelated staged changes along.
-OWN=(-- . ':(exclude)devkit' ':(exclude).devkit-rev')
+# The bootstrap too: a pinned sync writes it before its re-exec repeats this check.
+OWN=(-- . ':(exclude)devkit' ':(exclude).devkit-rev' ":(exclude)$BOOTSTRAP_COPY")
 if [ "$STAGE" = 0 ] && { ! git diff --quiet "${OWN[@]}" || ! git diff --cached --quiet "${OWN[@]}"; }; then
   echo "devkit-sync: commit or stash first; the sync makes its own commit" >&2; exit 2
 fi
@@ -105,7 +116,25 @@ else
 fi
 UPSTREAM_TREE=$(vendor_tree_of "$UPSTREAM") || exit 2
 CURRENT=0
-if [ -f .devkit-rev ] && [ "$(cut -d' ' -f1 .devkit-rev)" = "$UPSTREAM" ] && [ "$(git rev-parse HEAD:devkit 2>/dev/null)" = "$UPSTREAM_TREE" ]; then
+if [ "$PINNED" = 1 ]; then
+  [ "$(git show HEAD:.devkit-rev 2>/dev/null)" != "$UPSTREAM $UPSTREAM_TREE" ] || CURRENT=1
+  if [ -z "${DEVKIT_SYNC_REEXEC:-}" ]; then
+    entry=$(_vendor_entry "$UPSTREAM" "$BOOTSTRAP_BASE")
+    [ -n "$entry" ] || { echo "devkit-sync: ${UPSTREAM:0:7} predates the pinned mode (no $BOOTSTRAP_BASE); pin a newer devkit" >&2; exit 2; }
+    printf '%s %s\n' "$UPSTREAM" "$UPSTREAM_TREE" > .devkit-rev
+    git add .devkit-rev
+    # The new commit's bootstrap materializes it; the base-copy step below stages that copy.
+    git cat-file blob "${entry#* }" >"$BOOTSTRAP_COPY"
+    bash "$BOOTSTRAP_COPY" || { echo "devkit-sync: cannot materialize ${UPSTREAM:0:7} (above); .devkit-rev is staged, rerun once it can" >&2; exit 2; }
+    if [ -f devkit/bin/devkit-sync.sh ]; then
+      echo "devkit-sync: continuing with the materialized devkit/bin/devkit-sync.sh at ${UPSTREAM:0:7}"
+      # The resolved commit, never the caller's ref: a `main` resolved again could name another.
+      args=("$UPSTREAM")
+      [ "$STAGE" = 0 ] || args=(--stage "$UPSTREAM")
+      exec env DEVKIT_SYNC_REEXEC="$UPSTREAM" bash devkit/bin/devkit-sync.sh "${args[@]}"
+    fi
+  fi
+elif [ -f .devkit-rev ] && [ "$(cut -d' ' -f1 .devkit-rev)" = "$UPSTREAM" ] && [ "$(git rev-parse HEAD:devkit 2>/dev/null)" = "$UPSTREAM_TREE" ]; then
   CURRENT=1
 else
   # -f: staged leftovers of an interrupted sync are replaced like everything else under devkit/.
@@ -150,6 +179,13 @@ if [ "$STAGE" = 1 ]; then
 fi
 NOTE=
 [ "${#REFRESHED[@]}" -eq 0 ] || NOTE=$'\n'"Refreshed from the vendored bases: ${REFRESHED[*]}."
+if [ "$PINNED" = 1 ]; then
+  commit_sync "Update devkit to ${UPSTREAM:0:7}
+
+Pinned tree ${UPSTREAM_TREE:0:7} from $DEVKIT_URL $REF (devkit/ is materialized from .devkit-rev by $BOOTSTRAP_COPY).$NOTE"
+  echo "devkit at ${UPSTREAM:0:7} (tree ${UPSTREAM_TREE:0:7}), pinned"
+  exit 0
+fi
 commit_sync "Update devkit to ${UPSTREAM:0:7}
 
 Vendored tree ${UPSTREAM_TREE:0:7} from $DEVKIT_URL $REF (replaced wholesale; see devkit/bin/devkit-sync.sh).$NOTE"

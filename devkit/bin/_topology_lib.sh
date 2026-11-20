@@ -59,7 +59,10 @@ topology_hits() { # <who> <staged 0|1>
       return 2
     fi
     if [ "$where" = all ]; then specs=(.); else IFS=, read -ra specs <<<"$where"; fi
-    # git grep is 1 on no match and more on its own failure.
+    # git grep is 1 on no match and more on its own failure. ':!devkit/' holds in both modes:
+    # a vendored devkit/ is upstream's tree (devkit-check proves it), a pinned one is untracked,
+    # so git grep never sees it. It goes once no consumer vendors (stop-vendoring plan, step 6).
+    # bin/devkit-check.sh's check_retired_owner excludes devkit/ on the same grounds.
     rc=0
     found=$(git grep "${grep_args[@]}" -e "$pattern" -- "${specs[@]}" ':!devkit/' ':!docs/reports/' \
       ':!docs/audits/') || rc=$?

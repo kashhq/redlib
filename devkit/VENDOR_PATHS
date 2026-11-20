@@ -17,6 +17,7 @@ docs/metrics-keys.md
 lint
 metrics
 renovate
+templates/bootstrap
 templates/githooks
 templates/metrics
 templates/workflows
